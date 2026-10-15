@@ -1,0 +1,18 @@
+# Окружение и сборка
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Локальные настройки: абсолютные пути, план и личные заметки
+.mcp.json
+CLAUDE.md
+CLAUDE.local.md
+.claude/settings.local.json
+
+# Результаты работы
+*.blend
+*.blend1

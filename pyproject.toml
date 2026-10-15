@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zrenie"
+version = "0.1.0"
+description = "MCP-сервер «Зрение»: Claude хорошо видит референсы для 3D-моделирования"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+keywords = ["mcp", "claude", "3d", "blender", "reference", "computer-vision"]
+dependencies = [
+    "mcp>=2,<3",
+    "pillow>=12",
+    "numpy>=2",
+    "opencv-python-headless>=4.10",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+# Нейросети BiRefNet (фон) и SAM 2.1 (детали). torch ставить с CUDA-индекса, см. README.
+ai = ["torch>=2.14", "torchvision", "transformers>=5", "timm", "kornia", "einops", "huggingface_hub", "safetensors"]
+
+[project.scripts]
+zrenie = "zrenie.__main__:main"
+
+[tool.setuptools]
+packages = ["zrenie"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
