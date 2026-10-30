@@ -17,6 +17,7 @@ from PIL import Image, ImageDraw
 
 from . import draw
 from .layout import Box
+from .matting import GPU_LOCK
 
 log = logging.getLogger(__name__)
 
@@ -126,42 +127,43 @@ def segment(img: Image.Image, prompts: list[Prompt]) -> list[Part]:
     """Маска для каждой подсказки. Картинка кодируется один раз, подсказки — по очереди."""
     import torch
 
-    model, processor = _load()
-    rgb = img.convert("RGB")
-    base = processor(images=rgb, return_tensors="pt")
-    sizes = base["original_sizes"]
-    result = []
-    try:
-        with torch.no_grad():
-            embeddings = model.get_image_embeddings(base["pixel_values"].to(_device))
-            for p in prompts:
-                kwargs = {}
-                points = [*p.points, *p.exclude]
-                if points:
-                    kwargs["input_points"] = [[[list(map(float, q)) for q in points]]]
-                    kwargs["input_labels"] = [[[1] * len(p.points) + [0] * len(p.exclude)]]
-                if p.box is not None:
-                    kwargs["input_boxes"] = [[list(map(float, p.box))]]
-                inputs = processor(original_sizes=sizes, return_tensors="pt", **kwargs)
-                inputs = {k: v.to(_device) for k, v in inputs.items() if k != "original_sizes"}
-                # Одна точка — неоднозначна (деталь, её часть или весь объект): берём лучшую из трёх масок.
-                multimask = len(p.points) == 1 and not p.exclude and p.box is None
-                out = model(image_embeddings=embeddings, multimask_output=multimask, **inputs)
-                logits = processor.post_process_masks(out.pred_masks.cpu(), sizes, binarize=False)[0][0]  # (масок, H, W)
-                scores = out.iou_scores[0, 0].float().cpu().numpy()
-                masks = [_keep_main(m.float().numpy() > 0) for m in logits]
-                options = []
-                if multimask:
-                    by_size = sorted(range(len(masks)), key=lambda i: int(masks[i].sum()))
-                    sizes_named = dict(zip(("small", "medium", "large"), by_size))
-                    options = [(size, int(masks[i].sum()), float(scores[i])) for size, i in sizes_named.items()]
-                    best = sizes_named[p.pick] if p.pick in sizes_named else int(np.argmax(scores))
-                else:
-                    best = int(np.argmax(scores))
-                result.append(Part(p.name, masks[best], float(scores[best]), p, options))
-    finally:
-        if _device == "cuda":
-            torch.cuda.empty_cache()  # видеопамять нужна Blender
+    with GPU_LOCK:
+        model, processor = _load()
+        rgb = img.convert("RGB")
+        base = processor(images=rgb, return_tensors="pt")
+        sizes = base["original_sizes"]
+        result = []
+        try:
+            with torch.no_grad():
+                embeddings = model.get_image_embeddings(base["pixel_values"].to(_device))
+                for p in prompts:
+                    kwargs = {}
+                    points = [*p.points, *p.exclude]
+                    if points:
+                        kwargs["input_points"] = [[[list(map(float, q)) for q in points]]]
+                        kwargs["input_labels"] = [[[1] * len(p.points) + [0] * len(p.exclude)]]
+                    if p.box is not None:
+                        kwargs["input_boxes"] = [[list(map(float, p.box))]]
+                    inputs = processor(original_sizes=sizes, return_tensors="pt", **kwargs)
+                    inputs = {k: v.to(_device) for k, v in inputs.items() if k != "original_sizes"}
+                    # Одна точка — неоднозначна (деталь, её часть или весь объект): берём лучшую из трёх масок.
+                    multimask = len(p.points) == 1 and not p.exclude and p.box is None
+                    out = model(image_embeddings=embeddings, multimask_output=multimask, **inputs)
+                    logits = processor.post_process_masks(out.pred_masks.cpu(), sizes, binarize=False)[0][0]  # (масок, H, W)
+                    scores = out.iou_scores[0, 0].float().cpu().numpy()
+                    masks = [_keep_main(m.float().numpy() > 0) for m in logits]
+                    options = []
+                    if multimask:
+                        by_size = sorted(range(len(masks)), key=lambda i: int(masks[i].sum()))
+                        sizes_named = dict(zip(("small", "medium", "large"), by_size))
+                        options = [(size, int(masks[i].sum()), float(scores[i])) for size, i in sizes_named.items()]
+                        best = sizes_named[p.pick] if p.pick in sizes_named else int(np.argmax(scores))
+                    else:
+                        best = int(np.argmax(scores))
+                    result.append(Part(p.name, masks[best], float(scores[best]), p, options))
+        finally:
+            if _device == "cuda":
+                torch.cuda.empty_cache()  # видеопамять нужна Blender
     return result
 
 
@@ -384,22 +386,20 @@ def compare_part(name: str, ref_mask: np.ndarray, model_mask: np.ndarray, obj: B
 
 
 def compare_panels(
-    ref_img: Image.Image,
+    ref_rgb: np.ndarray,
     ref_parts: list[np.ndarray],
     model_parts_: list[np.ndarray],
     model_mask: np.ndarray,
-    obj: Box,
+    crop: tuple[int, int, int, int],
     colour_ids: list[int],
 ) -> list[tuple[str, Image.Image]]:
     """Референс с деталями, модель (серый силуэт) с деталями тех же цветов и контуры деталей поверх друг друга.
 
+    Всё — на холсте сравнения (compare.Comparison); crop — что показать: x1, y1, x2, y2.
     colour_ids — номер цвета каждой детали в COLOURS (как в parts)."""
     colours = [COLOURS[i % len(COLOURS)][0] for i in colour_ids]
-    ref_rgb = np.asarray(ref_img.convert("RGB"))
     model_rgb = np.full_like(ref_rgb, 235)
     model_rgb[model_mask] = 150
-    pad = round(0.06 * max(obj.w, obj.h))
-    crop = (max(0, obj.x1 - pad), max(0, obj.y1 - pad), min(ref_rgb.shape[1], obj.x2 + pad), min(ref_rgb.shape[0], obj.y2 + pad))
     width = max(2, round(max(ref_rgb.shape[:2]) / 400))
 
     def filled(base: np.ndarray, masks: list[np.ndarray]) -> np.ndarray:

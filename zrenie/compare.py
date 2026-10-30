@@ -1,5 +1,6 @@
 """Сравнение рендера модели с референсом: выравнивание силуэтов, совпадение (IoU), где и насколько расходятся."""
 
+import math
 from dataclasses import dataclass
 
 import cv2
@@ -18,6 +19,10 @@ BLOB_MIN_FRAC = 0.004  # пятна «не хватает / лишнее» ме�
 BLOB_REPORT = 3
 KEY_MATCH_TOL = 0.08
 KEY_REPORT_DIFF = 0.015
+# Модель шире кадра референса не обрезаем: холст расширяется, но не больше чем на размер вида с каждой стороны,
+# чтобы пол или фон на рендере не раздули его до гигантского.
+CANVAS_MAX_GROWTH = 1.0
+CANVAS_MARGIN_PX = 2  # запас на сглаживание края при масштабировании
 
 MISSING = (230, 40, 40)  # есть на референсе, нет у модели
 EXTRA = (40, 110, 255)  # есть у модели, нет на референсе
@@ -41,15 +46,39 @@ def alpha_matte(img: Image.Image) -> Matte | None:
 
 @dataclass
 class Comparison:
+    """Всё — в координатах холста: вид референса с запасом по краям, чтобы модель шире кадра вошла целиком."""
+
     iou: float
     scale: float  # во сколько раз увеличен рендер, чтобы совпасть по высоте
     ref: Shape
-    model: Shape  # силуэт модели после выравнивания, в координатах референса
+    model: Shape  # силуэт модели после выравнивания
     ref_mask: np.ndarray
-    model_mask: np.ndarray  # в координатах референса
-    model_rgb: np.ndarray  # рендер в координатах референса (для наложения)
+    model_mask: np.ndarray
+    ref_rgb: np.ndarray  # референс на холсте
+    model_rgb: np.ndarray  # рендер на холсте (для наложения)
     findings: list[str]
-    matrix: np.ndarray  # 2×3: пиксели рендера → пиксели референса (для деталей модели)
+    matrix: np.ndarray  # 2×3: пиксели рендера → пиксели холста (для деталей модели)
+    offset: tuple[int, int]  # где на холсте левый верхний угол вида референса
+
+    @property
+    def ref_box(self) -> Box:
+        """Рамка объекта референса в координатах вида."""
+        b, (ox, oy) = self.ref.bbox, self.offset
+        return Box(b.x1 - ox, b.y1 - oy, b.x2 - ox, b.y2 - oy)
+
+    def to_canvas(self, mask: np.ndarray) -> np.ndarray:
+        """Маска в координатах вида референса → на холст."""
+        (ox, oy), (h, w) = self.offset, mask.shape
+        canvas_h, canvas_w = self.ref_mask.shape
+        return np.pad(mask, ((oy, canvas_h - h - oy), (ox, canvas_w - w - ox)))
+
+    def shown_area(self) -> tuple[int, int, int, int]:
+        """Что показывать на картинках: референс и модель целиком и запас 6 % вокруг."""
+        r, m = self.ref.bbox, self.model.bbox
+        x1, y1, x2, y2 = min(r.x1, m.x1), min(r.y1, m.y1), max(r.x2, m.x2), max(r.y2, m.y2)
+        pad = round(0.06 * max(x2 - x1, y2 - y1))
+        h, w = self.ref_mask.shape
+        return max(0, x1 - pad), max(0, y1 - pad), min(w, x2 + pad), min(h, y2 + pad)
 
 
 def _extent(mask: np.ndarray, y1: int, y2: int) -> tuple[int, int] | None:
@@ -84,29 +113,51 @@ def _blobs(mask: np.ndarray, ref: Box, area: float) -> list[tuple[float, Box]]:
 
 
 def compare(ref_img: Image.Image, ref_matte: Matte, render_img: Image.Image, render_matte: Matte) -> Comparison | None:
-    ref = measure(ref_matte)
+    ref0 = measure(ref_matte)
     model0 = measure(render_matte)
-    if ref is None or model0 is None:
+    if ref0 is None or model0 is None:
         return None
     height, width = ref_matte.mask.shape
     # Выравниваем по высоте и низу: рендер масштабируется так, чтобы высота силуэта совпала, низ и центр рамки — тоже.
-    s = ref.bbox.h / model0.bbox.h
-    m_cx, r_cx = (model0.bbox.x1 + model0.bbox.x2) / 2, (ref.bbox.x1 + ref.bbox.x2) / 2
-    matrix = np.float32([[s, 0, r_cx - m_cx * s], [0, s, ref.bbox.y2 - model0.bbox.y2 * s]])
+    s = ref0.bbox.h / model0.bbox.h
+    m_cx, r_cx = (model0.bbox.x1 + model0.bbox.x2) / 2, (ref0.bbox.x1 + ref0.bbox.x2) / 2
+    tx, ty = r_cx - m_cx * s, ref0.bbox.y2 - model0.bbox.y2 * s
+    # Холст — вид референса с запасом по краям, чтобы модель, которая шире кадра, вошла целиком:
+    # обрезанная модель занижает расхождения. Запас слева, сверху, справа, снизу — и его потолок.
+    need = (
+        CANVAS_MARGIN_PX - (model0.bbox.x1 * s + tx),
+        CANVAS_MARGIN_PX - (model0.bbox.y1 * s + ty),
+        model0.bbox.x2 * s + tx + CANVAS_MARGIN_PX - width,
+        model0.bbox.y2 * s + ty + CANVAS_MARGIN_PX - height,
+    )
+    grow_x, grow_y = round(CANVAS_MAX_GROWTH * width), round(CANVAS_MAX_GROWTH * height)
+    limits = (grow_x, grow_y, grow_x, grow_y)
+    pad_left, pad_top, pad_right, pad_bottom = (min(limit, max(0, math.ceil(n))) for n, limit in zip(need, limits))
+    clipped = any(n > limit for n, limit in zip(need, limits))
+    pads = ((pad_top, pad_bottom), (pad_left, pad_right))
+    ref_alpha = np.pad(ref_matte.alpha, pads)
+    ref_rgb = np.pad(np.asarray(ref_img.convert("RGB")), (*pads, (0, 0)), mode="edge")
+    ref = measure(Matte(ref_alpha, ref_matte.method))
+    ref_mask = ref_alpha >= 0.5
+    height, width = ref_mask.shape
+
+    matrix = np.float32([[s, 0, tx + pad_left], [0, s, ty + pad_top]])
     warped_alpha = cv2.warpAffine(render_matte.alpha, matrix, (width, height), flags=cv2.INTER_LINEAR, borderValue=0)
     model_mask = warped_alpha >= 0.5
     model_rgb = cv2.warpAffine(np.asarray(render_img.convert("RGB")), matrix, (width, height), flags=cv2.INTER_LINEAR, borderValue=(128, 128, 128))
     model = measure(Matte(warped_alpha, render_matte.method))
-    ref_mask = ref_matte.mask
     union = np.logical_or(ref_mask, model_mask).sum()
     iou = float(np.logical_and(ref_mask, model_mask).sum() / union) if union else 0.0
 
     findings: list[str] = []
+    if clipped:
+        findings.append("Модель намного шире кадра референса — часть за краем не учтена. Проверь, нет ли на рендере лишнего: пола, фона, других объектов.")
     rb = ref.bbox
-    aspect_diff = (model.aspect - ref.aspect) / ref.aspect * 100
+    # Пропорции — по рендеру до выравнивания: масштаб их не меняет, а холст не обрезает.
+    aspect_diff = (model0.aspect - ref.aspect) / ref.aspect * 100
     if abs(aspect_diff) >= BAND_REPORT_DIFF * 100:
         findings.append(f"В целом модель {'шире' if aspect_diff > 0 else 'уже'} на {abs(aspect_diff):.1f} % при той же высоте "
-                        f"(ширина / высота: референс {ref.aspect:.3f}, модель {model.aspect:.3f}).")
+                        f"(ширина / высота: референс {ref.aspect:.3f}, модель {model0.aspect:.3f}).")
 
     # Полосы по высоте: (низ %, верх %, что, разница ширины, сдвиг левого края, сдвиг правого края).
     bands: list[list] = []
@@ -171,7 +222,7 @@ def compare(ref_img: Image.Image, ref_matte: Matte, render_img: Image.Image, ren
         findings.append(f"Отдельных частей: референс {ref.parts}, модель {model.parts}.")
     if model.holes != ref.holes:
         findings.append(f"Сквозных отверстий: референс {ref.holes}, модель {model.holes}.")
-    return Comparison(iou, s, ref, model, ref_mask, model_mask, model_rgb, findings, matrix)
+    return Comparison(iou, s, ref, model, ref_mask, model_mask, ref_rgb, model_rgb, findings, matrix, (pad_left, pad_top))
 
 
 def _contour(img: np.ndarray, mask: np.ndarray, colour: tuple[int, int, int], width: int) -> None:
@@ -179,13 +230,11 @@ def _contour(img: np.ndarray, mask: np.ndarray, colour: tuple[int, int, int], wi
     cv2.drawContours(img, contours, -1, colour, width)
 
 
-def panels(ref_img: Image.Image, c: Comparison, mode: str) -> list[tuple[str, Image.Image]]:
-    """Картинки для показа: референс, модель, разница или наложение — всё в координатах референса."""
-    ref_rgb = np.asarray(ref_img.convert("RGB")).astype(np.float32)
+def panels(c: Comparison, mode: str) -> list[tuple[str, Image.Image]]:
+    """Картинки для показа: референс, модель, разница или наложение — всё на холсте сравнения."""
+    ref_rgb = c.ref_rgb.astype(np.float32)
     width = max(2, round(max(ref_rgb.shape[:2]) / 400))
-    b = c.ref.bbox
-    pad = round(0.06 * max(b.w, b.h))
-    crop = (max(0, b.x1 - pad), max(0, b.y1 - pad), min(ref_rgb.shape[1], b.x2 + pad), min(ref_rgb.shape[0], b.y2 + pad))
+    crop = c.shown_area()
 
     def cut(a: np.ndarray) -> Image.Image:
         return Image.fromarray(a[crop[1] : crop[3], crop[0] : crop[2]].astype(np.uint8))

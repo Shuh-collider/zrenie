@@ -1,5 +1,9 @@
 import json
 import re
+import sys
+import time
+import types
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
@@ -126,6 +130,31 @@ async def test_compare_parts(bottle, tmp_path):
             "compare_parts", {"reference": str(bottle), "render": str(render), "match": {"крышка": ["нет"]}, "method": "simple"}
         )
         assert named.is_error and "тело" in named.content[0].text
+
+        empty = await client.call_tool("compare_parts", {"reference": str(bottle), "render": str(render), "match": {}, "method": "simple"})
+        assert not empty.is_error and empty.content[1].text == text  # пустой match — как не заданный
+
+
+def test_ai_models_run_one_call_at_a_time(monkeypatch):
+    """Инструменты идут в параллельных потоках: BiRefNet и SAM грузятся и считают по одному вызову за раз."""
+    inside, peak = 0, 0
+
+    def busy_load():
+        nonlocal inside, peak
+        inside += 1
+        peak = max(peak, inside)
+        time.sleep(0.05)
+        inside -= 1
+        raise RuntimeError("стоп")  # дальше нужен настоящий torch
+
+    monkeypatch.setitem(sys.modules, "torch", types.ModuleType("torch"))
+    monkeypatch.setattr(matting, "_load_model", busy_load)
+    monkeypatch.setattr(pt, "_load", busy_load)
+    img = Image.new("RGB", (32, 32))
+    with ThreadPoolExecutor(6) as pool:
+        calls = [pool.submit(matting.ai_matte, img) for _ in range(3)] + [pool.submit(pt.segment, img, []) for _ in range(3)]
+    assert all(isinstance(c.exception(), RuntimeError) for c in calls)
+    assert peak == 1
 
 
 def _sam_ready() -> bool:

@@ -776,12 +776,12 @@ def compare(reference: str, render: str, mode: str = "all", method: str = "auto"
     if mode not in COMPARE_MODES:
         raise ToolError(f"mode должен быть одним из: {', '.join(COMPARE_MODES)}")
     ref, model, result, ref_matte, model_matte = _compare_pair(reference, render, method)
-    picture = cmp.compose_rows([("", cmp.panels(ref.image, result, mode))])
+    picture = cmp.compose_rows([("", cmp.panels(result, mode))])
     shown, _ = imaging.render(picture)
     data, fmt = imaging.encode(shown, force_png=True)
     lines = [
         f"Совпадение силуэтов: {result.iou * 100:.1f} % (IoU).",
-        f"Референс: {ref.name}, объект {_box_text(_in_original(ref, result.ref.bbox))}; фон: {ref_matte.method}.",
+        f"Референс: {ref.name}, объект {_box_text(_in_original(ref, result.ref_box))}; фон: {ref_matte.method}.",
         f"Модель: {model.name}, силуэт: {model_matte.method}; выровнена по высоте и низу (масштаб ×{result.scale:.3f}).",
         cmp.LEGEND,
     ]
@@ -810,7 +810,7 @@ def compare_views(
         ref, model, result, _, model_matte = _compare_pair(reference, render, method)
         title = vs.label_text(labels[i] if labels else None, f"{i + 1}: {ref.name}")
         scores.append(result.iou)
-        rows.append((f"{title} · совпадение {result.iou * 100:.1f} %", cmp.panels(ref.image, result, "all")))
+        rows.append((f"{title} · совпадение {result.iou * 100:.1f} %", cmp.panels(result, "all")))
         lines.append(f"«{title}»: {result.iou * 100:.1f} % — {ref.name} ↔ {model.name} (силуэт модели: {model_matte.method}).")
         lines += [f"    {f}" for f in result.findings] or ["    Заметных расхождений нет."]
     picture = cmp.compose_rows(rows)
@@ -1019,7 +1019,7 @@ def compare_parts(
     if model_matte is None:
         raise ToolError("У карты деталей должен быть прозрачный фон (film_transparent).")
 
-    if match is None:
+    if not match:  # пустой match — то же, что не задан
         lower = {n.lower(): n for n in colours}
         pairs = [(name, [lower[name.lower()]]) for name in ref_parts if name.lower() in lower]
         if not pairs:
@@ -1041,7 +1041,7 @@ def compare_parts(
     result = cmp.compare(ref.image, ref_matte, model.image, model_matte)
     if result is None:
         raise ToolError("На референсе или на рендере объект не найден — сравнивать нечего.")
-    h, w = ref_matte.mask.shape
+    h, w = result.ref_mask.shape  # холст сравнения: вид референса с запасом, если модель шире кадра
     masks = pt.model_parts(model.image, colours)
     warped = {
         name: cv2.warpAffine(m.astype(np.float32), result.matrix, (w, h), flags=cv2.INTER_LINEAR, borderValue=0) >= 0.5
@@ -1049,16 +1049,17 @@ def compare_parts(
     }
 
     obj = result.ref.bbox
+    ref_masks = {name: result.to_canvas(ref_parts[name].mask) for name, _ in pairs}
     rows = []
     for name, objects in pairs:
         model_mask = np.zeros((h, w), bool)
         for o in objects:
             model_mask |= warped[o]
-        rows.append((pt.compare_part(name, ref_parts[name].mask, model_mask, obj), objects, model_mask))
+        rows.append((pt.compare_part(name, ref_masks[name], model_mask, obj), objects, model_mask))
 
     numbered = {n: list(ref_parts).index(n) for n, _ in pairs}  # цвет — как у детали в parts
     panels = pt.compare_panels(
-        ref.image, [ref_parts[n].mask for n, _ in pairs], [m for _, _, m in rows], result.model_mask, obj, [numbered[n] for n, _ in pairs]
+        result.ref_rgb, [ref_masks[n] for n, _ in pairs], [m for _, _, m in rows], result.model_mask, result.shown_area(), [numbered[n] for n, _ in pairs]
     )
     shown, _ = imaging.render(cmp.compose_rows([("", panels)]))
     data, fmt = imaging.encode(shown, force_png=True)

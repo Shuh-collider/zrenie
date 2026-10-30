@@ -9,6 +9,7 @@
 
 import importlib.util
 import logging
+import threading
 from dataclasses import dataclass
 
 import cv2
@@ -34,6 +35,10 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 METHODS = ("auto", "simple", "ai")
+
+# Инструменты сервера работают в параллельных потоках. Нейросети (BiRefNet и SAM в parts.py) грузятся и считают
+# по одному вызову за раз: иначе модель загрузится дважды, а видеопамять, нужная и Blender, уйдёт на два расчёта сразу.
+GPU_LOCK = threading.Lock()
 
 
 @dataclass
@@ -137,18 +142,19 @@ def _load_model():
 def ai_matte(img: Image.Image) -> Matte:
     import torch
 
-    model = _load_model()
     rgb = img.convert("RGB")
     width, height = rgb.size
     x = np.asarray(rgb.resize((BIREFNET_SIZE, BIREFNET_SIZE), Image.Resampling.BILINEAR), np.float32) / 255.0
     x = (x - np.array(IMAGENET_MEAN, np.float32)) / np.array(IMAGENET_STD, np.float32)
-    tensor = torch.from_numpy(x.transpose(2, 0, 1)).unsqueeze(0).to(_device)
-    if _device == "cuda":
-        tensor = tensor.half()
-    with torch.no_grad():
-        pred = model(tensor)[-1].sigmoid()[0, 0].float().cpu().numpy()
-    if _device == "cuda":
-        torch.cuda.empty_cache()  # отдаём видеопамять обратно — она нужна Blender
+    with GPU_LOCK:
+        model = _load_model()
+        tensor = torch.from_numpy(x.transpose(2, 0, 1)).unsqueeze(0).to(_device)
+        if _device == "cuda":
+            tensor = tensor.half()
+        with torch.no_grad():
+            pred = model(tensor)[-1].sigmoid()[0, 0].float().cpu().numpy()
+        if _device == "cuda":
+            torch.cuda.empty_cache()  # отдаём видеопамять обратно — она нужна Blender
     alpha = cv2.resize(pred, (width, height), interpolation=cv2.INTER_LINEAR)
     alpha = np.clip(alpha, 0, 1).astype(np.float32)
     noise = ~_clean(alpha >= 0.5)  # мелкий мусор — в фон

@@ -1,6 +1,8 @@
+import numpy as np
 from PIL import Image, ImageDraw
 
 from zrenie import compare, matting
+from zrenie.layout import Box
 
 BACKGROUND = (205, 207, 210)
 
@@ -46,15 +48,47 @@ def test_wider_body_and_taller_neck_are_reported():
     assert "Ключевые высоты сдвинуты" in text or "Не хватает" in text
 
 
+def _narrow_frame():
+    """Референс с полями 10 %: тело 100×200 (x 10…109, y 10…209) в кадре 120×220."""
+    img = Image.new("RGB", (120, 220), BACKGROUND)
+    ImageDraw.Draw(img).rectangle([10, 10, 109, 209], fill=(90, 60, 40))
+    return img
+
+
+def test_model_wider_than_reference_frame_is_not_cut_off():
+    ref = _narrow_frame()
+    render = Image.new("RGBA", (400, 300), (0, 0, 0, 0))
+    ImageDraw.Draw(render).rectangle([125, 50, 274, 249], fill=(150, 150, 160, 255))  # в 1,5 раза шире, вылезает за кадр
+    result = compare.compare(ref, matting.simple_matte(ref), render, compare.alpha_matte(render))
+    assert abs(result.iou - 100 / 150) < 0.02
+    assert "шире на 50.0 %" in result.findings[0]
+    assert result.ref_box == Box(10, 10, 110, 210)  # в координатах вида, без запаса холста
+    body = np.zeros((220, 120), bool)
+    body[10:210, 10:110] = True
+    assert (result.to_canvas(body) == result.ref_mask).all()
+    x1, _, x2, _ = result.shown_area()
+    assert x2 - x1 > 150  # на картинках модель видна целиком
+
+
+def test_floor_in_render_does_not_blow_up_the_canvas():
+    ref = _narrow_frame()
+    render = Image.new("RGBA", (6000, 300), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(render)
+    draw.rectangle([2950, 50, 3049, 247], fill=(150, 150, 160, 255))
+    draw.rectangle([0, 248, 5999, 249], fill=(150, 150, 160, 255))  # пол на всю ширину
+    result = compare.compare(ref, matting.simple_matte(ref), render, compare.alpha_matte(render))
+    assert result.ref_mask.shape[1] <= 3 * 120
+    assert "пола" in result.findings[0]
+
+
 def test_opaque_render_has_no_alpha_matte():
     assert compare.alpha_matte(_reference()) is None
     assert compare.alpha_matte(Image.new("RGBA", (10, 10), (1, 2, 3, 255))) is None
 
 
 def test_panels_and_rows():
-    ref = _reference()
     result = _compare(_render(body_half=150))
     for mode, count in (("all", 3), ("side", 2), ("diff", 1), ("overlay", 1)):
-        assert len(compare.panels(ref, result, mode)) == count
-    sheet = compare.compose_rows([("вид", compare.panels(ref, result, "all")), ("вид 2", compare.panels(ref, result, "all"))])
+        assert len(compare.panels(result, mode)) == count
+    sheet = compare.compose_rows([("вид", compare.panels(result, "all")), ("вид 2", compare.panels(result, "all"))])
     assert sheet.width > 600 and sheet.height > 2 * 360  # две строки по три панели
