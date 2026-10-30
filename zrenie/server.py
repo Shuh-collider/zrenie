@@ -54,9 +54,13 @@ mcp = MCPServer(
         "место, наклон, цвет; потом вид «путь|имя» (или «путь|N|имя») работает с одной деталью во всех инструментах; "
         "compare_parts(reference, render) — модель по деталям против референса; рендер — карта деталей: "
         f"{BLENDER_HINT} "
-        "Все координаты — пиксели оригинала. Пути к файлам — только абсолютные."
+        "Все координаты — пиксели оригинала. На картинках inspect, split_views, view, mark и parts по верхнему и левому "
+        "краю — линейки с подписями в пикселях оригинала: координаты для region, points, lines и box читай по ним. "
+        "Обзорные картинки (inspect, silhouette, contour, align_views, compare) уменьшены — мелкое смотри через view. "
+        "Пути к файлам — только абсолютные."
     ),
 )
+RULERS_TEXT = "Линейки сверху (x) и слева (y) — в пикселях оригинала."
 
 
 @lru_cache(maxsize=16)
@@ -149,8 +153,9 @@ def inspect(path: str) -> list[Image | str]:
     """
     img, p, key = _open(path)
     found = _cached_layout(*key)
-    shown, flattened = imaging.render(img)
+    shown, flattened = imaging.render(img, max_tokens=imaging.OVERVIEW_TOKENS)
     scale = img.width / shown.width
+    shown = measure.draw_rulers(shown, layout.Box(0, 0, img.width, img.height))
     if len(found.views) > 1:
         shown = draw.draw_boxes(shown, found.views, scale)
     data, fmt = imaging.encode(shown)
@@ -170,6 +175,7 @@ def inspect(path: str) -> list[Image | str]:
     if found.dropped:
         lines.append(f"Отброшено мелких кусков (подписи, тени): {found.dropped}.")
     lines.append(f"Цвет фона по краям: {_border_colour(img)}.")
+    lines.append(RULERS_TEXT)
     lines.append(
         "Дальше: split_views — все кадры крупно; view(path, region=[x1, y1, x2, y2]) — любая область крупно; "
         "mode='contrast' | 'edges' | 'tones' — рельеф, контуры, свет и тень."
@@ -195,7 +201,7 @@ def split_views(path: str, max_edge: int = SPLIT_MAX_EDGE) -> list[Image | str]:
 
     out: list[Image | str] = []
     for i, box in enumerate(shown_views, 1):
-        prepared = imaging.prepare(img.crop(box.as_list()), max_edge)
+        prepared = imaging.prepare(img.crop(box.as_list()), max_edge, rulers=box)
         s = box.w / prepared.size[0]
         out.append(
             f"Кадр {i} из {len(views)}: область оригинала {_box_text(box)}; показан {prepared.size[0]}×{prepared.size[1]} px; "
@@ -210,6 +216,7 @@ def split_views(path: str, max_edge: int = SPLIT_MAX_EDGE) -> list[Image | str]:
         summary.append("Это не лист — один кадр, показан без пустых полей.")
     if len(views) > len(shown_views):
         summary.append(f"Показаны первые {len(shown_views)}; остальные смотри через view(path, region=...) по координатам из inspect.")
+    summary.append(RULERS_TEXT)
     summary.append("Детали: view(path, region=[x1, y1, x2, y2], mode=...) в координатах оригинала.")
     out.append("\n".join(summary))
     return out
@@ -232,7 +239,7 @@ def view(
     max_edge: потолок длинной стороны в px, от 200 до 2576. По умолчанию 2000 — так картинка
         не упрётся в лимит, когда в разговоре больше 20 картинок.
 
-    Возвращает картинку и текст с формулой перевода координат в пиксели оригинала.
+    Возвращает картинку с линейками по краям (подписи — пиксели оригинала) и текст с формулой перевода координат.
     """
     _check_max_edge(max_edge)
     _check_mode(mode)
@@ -252,10 +259,12 @@ def view(
     else:
         source = img
 
-    prepared = imaging.prepare(source, max_edge, mode)
+    shown_box = layout.Box(*box) if box is not None else layout.Box(0, 0, img.width, img.height)
+    prepared = imaging.prepare(source, max_edge, mode, rulers=shown_box)
     text = imaging.describe(p, img.size, prepared, box, mode)
     if box is not None and box != requested:
         text += f"\nОбласть подрезана по краям картинки: запрошено {requested}, показано {box}."
+    text += f"\n{RULERS_TEXT}"
     # Картинка перед текстом — так Claude понимает изображения лучше.
     return [Image(data=prepared.data, format=prepared.fmt), text]
 
@@ -355,7 +364,7 @@ def silhouette(view: str, method: str = "auto") -> list[Image | str]:
     source = _source(view, require_single=False)
     matte = _matte(source, method)
     shape = vs.measure(matte)
-    shown, _ = imaging.render(vs.silhouette_preview(source, matte, shape))
+    shown, _ = imaging.render(vs.silhouette_preview(source, matte, shape), max_tokens=imaging.OVERVIEW_TOKENS)
     data, fmt = imaging.encode(shown)
     s = source.box.w / shown.width
 
@@ -402,7 +411,7 @@ def align_views(views: list[str], labels: list[str] | None = None, method: str =
     """
     aligned = _aligned(views, labels, method)
     canvas, guides = vs.compose_aligned(aligned)
-    shown, _ = imaging.render(canvas)
+    shown, _ = imaging.render(canvas, max_tokens=imaging.OVERVIEW_TOKENS)
     data, fmt = imaging.encode(shown)
     f = canvas.width / shown.width
 
@@ -613,9 +622,10 @@ def mark(
     region = measure.marks_region(list(pts), list(segs), source.box)
     crop = source.image.crop((region.x1 - origin[0], region.y1 - origin[1], region.x2 - origin[0], region.y2 - origin[1]))
     shown, _ = imaging.render(crop)
-    picture = measure.draw_marks(shown, region, list(pts), names, list(segs))
+    picture = measure.draw_marks(measure.draw_rulers(shown, region), region, list(pts), names, list(segs))
     s = region.w / shown.width
     text.append(f"Показана область {_box_text(region)}; x = {region.x1} + x_показ × {s:.4f}, y = {region.y1} + y_показ × {s:.4f}.")
+    text.append(RULERS_TEXT)
     data, fmt = imaging.encode(picture)
     return [Image(data=data, format=fmt), "\n".join(text)]
 
@@ -655,7 +665,7 @@ def contour(
     units_per_px = (real_height or 1.0) / bbox.h
     unit = "ед. сцены" if real_height else "высоты объекта"
 
-    shown, _ = imaging.render(vs.silhouette_preview(source, matte, None))
+    shown, _ = imaging.render(vs.silhouette_preview(source, matte, None), max_tokens=imaging.OVERVIEW_TOKENS)
     picture = measure.draw_contours(shown, source.box.w / shown.width, contours, axis)
     data, fmt = imaging.encode(picture, force_png=True)
 
@@ -777,7 +787,7 @@ def compare(reference: str, render: str, mode: str = "all", method: str = "auto"
         raise ToolError(f"mode должен быть одним из: {', '.join(COMPARE_MODES)}")
     ref, model, result, ref_matte, model_matte = _compare_pair(reference, render, method)
     picture = cmp.compose_rows([("", cmp.panels(result, mode))])
-    shown, _ = imaging.render(picture)
+    shown, _ = imaging.render(picture, max_tokens=imaging.OVERVIEW_TOKENS)
     data, fmt = imaging.encode(shown, force_png=True)
     lines = [
         f"Совпадение силуэтов: {result.iou * 100:.1f} % (IoU).",
@@ -814,7 +824,7 @@ def compare_views(
         lines.append(f"«{title}»: {result.iou * 100:.1f} % — {ref.name} ↔ {model.name} (силуэт модели: {model_matte.method}).")
         lines += [f"    {f}" for f in result.findings] or ["    Заметных расхождений нет."]
     picture = cmp.compose_rows(rows)
-    shown, _ = imaging.render(picture)
+    shown, _ = imaging.render(picture, max_tokens=imaging.OVERVIEW_TOKENS)
     data, fmt = imaging.encode(shown, force_png=True)
     worst = min(range(len(scores)), key=lambda i: scores[i])
     header = [
@@ -940,7 +950,7 @@ def parts(view: str, parts: list[PartPrompt], method: str = "auto") -> list[Imag
     obj_shape = vs.measure(obj_matte)
     shown, _ = imaging.render(source.image)
     s = source.box.w / shown.width
-    picture = pt.draw_parts(shown, found, s, numbers)
+    picture = measure.draw_rulers(pt.draw_parts(shown, found, s, numbers), source.box)
     data, fmt = imaging.encode(picture)
 
     origin = (source.box.x1, source.box.y1)
@@ -983,6 +993,7 @@ def parts(view: str, parts: list[PartPrompt], method: str = "auto") -> list[Imag
         "mark, grid, align_views. На картинке: белые точки — твои точки, крестики цвета детали — exclude, рамка — box."
     )
     lines.append(f"Показано {shown.width}×{shown.height} px; x = {source.box.x1} + x_показ × {s:.4f}, y = {source.box.y1} + y_показ × {s:.4f}.")
+    lines.append(RULERS_TEXT)
     return [Image(data=data, format=fmt), "\n".join(lines)]
 
 
@@ -1061,7 +1072,7 @@ def compare_parts(
     panels = pt.compare_panels(
         result.ref_rgb, [ref_masks[n] for n, _ in pairs], [m for _, _, m in rows], result.model_mask, result.shown_area(), [numbered[n] for n, _ in pairs]
     )
-    shown, _ = imaging.render(cmp.compose_rows([("", panels)]))
+    shown, _ = imaging.render(cmp.compose_rows([("", panels)]), max_tokens=imaging.OVERVIEW_TOKENS)
     data, fmt = imaging.encode(shown, force_png=True)
 
     scores = [c.iou for c, _, _ in rows]

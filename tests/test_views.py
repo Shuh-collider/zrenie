@@ -55,6 +55,20 @@ def test_ai_matte_excludes_shadow_on_real_reference():
     assert shape.bbox.y2 < 905  # тень под наушниками (~y 900–930) не попала в объект
 
 
+def test_warm_up_loads_birefnet_under_the_lock_and_never_fails(monkeypatch):
+    loads = []
+    monkeypatch.setattr(matting, "ai_available", lambda: True)
+    monkeypatch.setattr(matting, "_load_model", lambda: loads.append(matting.GPU_LOCK.locked()))
+    matting.warm_up()
+    assert loads == [True]  # загрузка — под общей блокировкой нейросетей
+
+    def broken():
+        raise OSError("нет сети")
+
+    monkeypatch.setattr(matting, "_load_model", broken)
+    matting.warm_up()  # ошибка только в лог: сервер работает, модель загрузится при первом вызове
+
+
 def test_parse_spec_forms(tmp_path):
     sheet_path = tmp_path / "лист 2×2.jpg"
     Image.open(REFS / "sheet_seams_4.jpg").save(sheet_path, quality=95)

@@ -162,6 +162,19 @@ def ai_matte(img: Image.Image) -> Matte:
     return Matte(alpha, f"BiRefNet ({'видеокарта' if _device == 'cuda' else 'процессор'})")
 
 
+def warm_up() -> None:
+    """Загружает BiRefNet заранее — сервер запускает это в фоне при старте, чтобы первый вызов не ждал загрузки."""
+    if not ai_available():
+        return
+    try:
+        with GPU_LOCK:
+            _load_model()
+        if _device == "cuda":
+            ai_matte(Image.new("RGB", (64, 64)))  # первый расчёт на видеокарте медленный — пусть пройдёт сейчас
+    except Exception:  # не вышло — модель загрузится при первом вызове, и там будет понятная ошибка
+        log.exception("BiRefNet заранее не загрузился")
+
+
 def matte(img: Image.Image, method: str = "auto") -> Matte:
     """method: "auto" — нейросеть, если установлена, иначе простой; "simple"; "ai"."""
     if method not in METHODS:

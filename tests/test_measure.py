@@ -3,6 +3,7 @@ import pytest
 from PIL import Image, ImageDraw
 
 from zrenie import matting, measure, views
+from zrenie.layout import Box
 
 BACKGROUND = (205, 207, 210)
 
@@ -20,6 +21,19 @@ def _bottle(offset_x=0):
 @pytest.mark.parametrize(("span", "step"), [(1152, 200), (920, 100), (480, 50), (130, 20), (9, 1)])
 def test_nice_step(span, step):
     assert measure.nice_step(span) == step
+
+
+def test_rulers_are_in_original_pixels():
+    shown = Image.new("RGB", (1000, 500), "white")
+    out = measure.draw_rulers(shown, Box(2000, 1000, 4000, 2000))  # 2 px оригинала на пиксель показа
+    assert out.size == shown.size
+    a = np.asarray(out)
+    magenta = np.all(a == measure.GRID_COLOUR, axis=2)
+    assert magenta[2, 99:102].any()  # деление x = 2200: (2200 − 2000) / 2 = 100 px показа
+    assert magenta[99:102, 2].any()  # деление y = 1200: (1200 − 1000) / 2 = 100 px показа
+    assert not magenta[2, 145:155].any()  # между делениями картинка как была
+    assert (a[8:24, 85:115] < 100).any()  # подпись «2200» под делением
+    assert (a[300:, 100:] == 255).all()  # середина картинки не тронута
 
 
 def test_symmetry_axis_and_half_profile():

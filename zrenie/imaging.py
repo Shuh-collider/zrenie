@@ -7,13 +7,17 @@ from pathlib import Path
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-from . import modes
+from . import measure, modes
+from .layout import Box
 
 # Лимиты Claude 4.7+ (high-resolution tier), см. docs: build-with-claude/vision.
 MAX_TOKENS = 4784
 HIRES_MAX_EDGE = 2576
 # Когда в разговоре больше 20 картинок, каждая должна быть ≤ 2000 px — поэтому это потолок по умолчанию.
 DEFAULT_MAX_EDGE = 2000
+# Обзорные картинки (лист целиком, силуэт, виды рядом, сравнение с моделью) — до ~1600 токенов (≈ 1120×1120 px):
+# форму видно, а мелкое Claude смотрит через view. Так разговор дольше не забивается картинками.
+OVERVIEW_TOKENS = 1600
 # На картинках меньше ~200 px Claude ошибается.
 MIN_EDGE = 200
 # Мелкое увеличиваем: если длинная сторона меньше 768 px — до 1024 px, но не больше чем в 4 раза.
@@ -86,13 +90,13 @@ def resized_size(
     return (lo, max(round(lo / aspect_ratio), 1))
 
 
-def fit_size(width: int, height: int, max_edge: int = DEFAULT_MAX_EDGE) -> tuple[int, int]:
+def fit_size(width: int, height: int, max_edge: int = DEFAULT_MAX_EDGE, max_tokens: int = MAX_TOKENS) -> tuple[int, int]:
     """Размер показа: мелкое увеличиваем, крупное ужимаем по правилам Claude."""
     long_edge = max(width, height)
     if long_edge < UPSCALE_BELOW:
         factor = min(MAX_UPSCALE, UPSCALE_TARGET / long_edge)
         width, height = max(1, round(width * factor)), max(1, round(height * factor))
-    return resized_size(width, height, max_edge=max_edge, max_tokens=MAX_TOKENS)
+    return resized_size(width, height, max_edge=max_edge, max_tokens=max_tokens)
 
 
 def resolve_path(path: str) -> Path:
@@ -161,10 +165,14 @@ def _choose_format(img: Image.Image) -> str:
     return "png" if len(png) <= PNG_VS_JPEG_RATIO * len(jpeg) else "jpeg"
 
 
-def render(img: Image.Image, max_edge: int = DEFAULT_MAX_EDGE, mode: str = "normal") -> tuple[Image.Image, bool]:
-    """Новая картинка размера показа в нужном режиме. Возвращает (картинка, была_ли_прозрачность)."""
+def render(
+    img: Image.Image, max_edge: int = DEFAULT_MAX_EDGE, mode: str = "normal", max_tokens: int = MAX_TOKENS
+) -> tuple[Image.Image, bool]:
+    """Новая картинка размера показа в нужном режиме. Возвращает (картинка, была_ли_прозрачность).
+
+    max_tokens — бюджет визуальных токенов: OVERVIEW_TOKENS для обзорных картинок."""
     viewable, flattened = to_viewable(img)
-    target = fit_size(*viewable.size, max_edge=max_edge)
+    target = fit_size(*viewable.size, max_edge=max_edge, max_tokens=max_tokens)
     if target != viewable.size:
         viewable = viewable.resize(target, Image.Resampling.LANCZOS)
     else:
@@ -180,9 +188,13 @@ def encode(img: Image.Image, force_png: bool = False) -> tuple[bytes, str]:
     return data, fmt
 
 
-def prepare(img: Image.Image, max_edge: int = DEFAULT_MAX_EDGE, mode: str = "normal") -> Prepared:
-    """Ужимает (или увеличивает мелкое) до точного размера, который Claude примет без пережатия, и кодирует."""
+def prepare(img: Image.Image, max_edge: int = DEFAULT_MAX_EDGE, mode: str = "normal", rulers: Box | None = None) -> Prepared:
+    """Ужимает (или увеличивает мелкое) до точного размера, который Claude примет без пережатия, и кодирует.
+
+    rulers — какая область оригинала на картинке: тогда по краям рисуются линейки в её пикселях."""
     shown, flattened = render(img, max_edge, mode)
+    if rulers is not None:
+        shown = measure.draw_rulers(shown, rulers)
     data, fmt = encode(shown, force_png=mode in modes.LINE_MODES)
     return Prepared(data=data, fmt=fmt, size=shown.size, flattened_alpha=flattened)
 

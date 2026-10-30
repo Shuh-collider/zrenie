@@ -16,6 +16,8 @@ from .layout import Box
 GRID_COLOUR = (255, 0, 255)
 GRID_TARGET_LINES = 10  # примерно столько подписанных линий по длинной стороне
 GRID_MINOR_MIN_PX = 14  # тонкие линии рисуем, только если между ними на показе не меньше 14 px
+RULER_MIN_GAP_PX = 70  # подписи на линейке — не чаще чем через 70 px показа
+RULER_MINOR_MIN_PX = 8  # мелкие деления — если между ними на показе не меньше 8 px
 
 SNAP_RADIUS = 12  # точку притягиваем к краю не дальше 12 px оригинала
 MARK_COLOURS = [(255, 0, 255), (0, 200, 255), (255, 160, 0), (0, 220, 120), (255, 60, 60), (160, 100, 255)]
@@ -91,6 +93,35 @@ def draw_percent_grid(shown: Image.Image, region: Box, obj: Box) -> Image.Image:
         if major:
             _label(pen, (x, max(0, top - 2)), f"{pct}", "mb" if top > size + 4 else "mt", size)
             _label(pen, (max(0, left - 4), y), f"{pct}", "rm" if left > 3 * size else "lm", size)
+    return Image.alpha_composite(shown.convert("RGBA"), overlay).convert("RGB")
+
+
+def draw_rulers(shown: Image.Image, region: Box) -> Image.Image:
+    """Линейки по верхнему (x) и левому (y) краю с подписями в пикселях оригинала — координаты читаются с картинки.
+
+    region — какая область оригинала показана. Размер картинки не меняется: деления лежат поверх краёв.
+    """
+    sx, sy = region.w / shown.width, region.h / shown.height  # пикселей оригинала на пиксель показа
+    step = nice_step(RULER_MIN_GAP_PX * max(sx, sy), 1)
+    k = 5 if step / 5 / max(sx, sy) >= RULER_MINOR_MIN_PX else 1  # делений на одну подпись
+    minor = step / k
+    size = max(12, round(min(shown.size) / 80))
+    tick = max(6, size // 2)
+    overlay = Image.new("RGBA", shown.size, (0, 0, 0, 0))
+    pen = ImageDraw.Draw(overlay)
+    colour = GRID_COLOUR + (255,)
+    for i in range(math.ceil(region.x1 / minor), math.floor(region.x2 / minor) + 1):
+        x = (i * minor - region.x1) / sx
+        major = i % k == 0
+        pen.line([(x, 0), (x, tick if major else tick // 2)], fill=colour, width=2 if major else 1)
+        if major and 3 * size <= x <= shown.width - 2 * size:  # у левого края — подписи y
+            _label(pen, (x, tick + 1), str(i // k * step), "mt", size)
+    for i in range(math.ceil(region.y1 / minor), math.floor(region.y2 / minor) + 1):
+        y = (i * minor - region.y1) / sy
+        major = i % k == 0
+        pen.line([(0, y), (tick if major else tick // 2, y)], fill=colour, width=2 if major else 1)
+        if major and 2 * size <= y <= shown.height - size:
+            _label(pen, (tick + 2, y), str(i // k * step), "lm", size)
     return Image.alpha_composite(shown.convert("RGBA"), overlay).convert("RGB")
 
 

@@ -10,6 +10,7 @@ import pytest
 from mcp import Client, StdioServerParameters
 from PIL import Image, ImageDraw
 
+from zrenie import imaging
 from zrenie.server import mcp
 
 REFS = Path(__file__).parent / "refs"
@@ -77,6 +78,17 @@ async def test_view_region_is_upscaled_and_maps_back(sheet_ref):
     image, text = result.content
     assert max(_image(image).size) == 936  # 234 px × 4 — мелкая область увеличена
     assert "x = 150 + x_показ × 0.2500" in text.text
+    assert "Линейки" in text.text
+
+
+@pytest.mark.anyio
+async def test_overview_is_smaller_than_view(reference):
+    """Обзор целиком — в бюджете обзорных картинок, крупный вид — в полном размере."""
+    async with Client(mcp) as client:
+        overview = await client.call_tool("inspect", {"path": str(reference)})
+        detail = await client.call_tool("view", {"path": str(reference)})
+    assert imaging.count_image_tokens(*_image(overview.content[0]).size) <= imaging.OVERVIEW_TOKENS
+    assert imaging.count_image_tokens(*_image(detail.content[0]).size) > 2 * imaging.OVERVIEW_TOKENS
 
 
 @pytest.mark.anyio
