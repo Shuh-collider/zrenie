@@ -261,6 +261,10 @@ async def test_grid_mark_contour_palette(bottle, tmp_path):
         profile = data["half_profile"]
         assert profile[0][0] == pytest.approx(0, abs=1e-4) and profile[-1][0] == pytest.approx(0, abs=1e-4)
 
+        not_json = tmp_path / "картинка.png"
+        refused = await client.call_tool("contour", {"view": front, "save_to": str(not_json), "method": "simple"})
+        assert refused.is_error and ".json" in refused.content[0].text and not not_json.exists()
+
         colours = await client.call_tool("palette", {"view": front, "colors": 2, "method": "simple"})
         assert not colours.is_error and "#5A3C28" in colours.content[1].text  # (90, 60, 40)
 

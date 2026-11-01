@@ -743,6 +743,11 @@ def contour(
         raise ToolError("detail должен быть от 0.0005 до 0.05")
     if real_height is not None and real_height <= 0:
         raise ToolError("real_height должен быть больше нуля")
+    out = Path(save_to).expanduser() if save_to else None
+    if out is not None and not out.is_absolute():
+        raise ToolError(f"save_to — нужен абсолютный путь, получено: {save_to}")
+    if out is not None and out.suffix.lower() != ".json":  # чтобы по ошибке не затереть картинку, документ или код
+        raise ToolError(f"save_to — путь к файлу .json, получено: {save_to}")
     source = _source(view, require_single=False)
     matte, shape = _shape(source, method)
     bbox = shape.bbox
@@ -797,10 +802,7 @@ def contour(
         text.append(" ".join(f"({x:.4f}, {z:.4f})" for x, z in scene))
         if not symmetric:
             text.append("Внимание: объект несимметричен — профиль для тела вращения будет неточным.")
-    if save_to:
-        out = Path(save_to).expanduser()
-        if not out.is_absolute():
-            raise ToolError(f"save_to — нужен абсолютный путь, получено: {save_to}")
+    if out is not None:
         try:
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(json.dumps(record, ensure_ascii=False, indent=1), encoding="utf-8")

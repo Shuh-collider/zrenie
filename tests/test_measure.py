@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 from PIL import Image, ImageDraw
 
-from zrenie import matting, measure, views
+from zrenie import draw, matting, measure, views
 from zrenie.layout import Box
 
 BACKGROUND = (205, 207, 210)
@@ -21,6 +21,20 @@ def _bottle(offset_x=0):
 @pytest.mark.parametrize(("span", "step"), [(1152, 200), (920, 100), (480, 50), (130, 20), (9, 1)])
 def test_nice_step(span, step):
     assert measure.nice_step(span) == step
+
+
+def test_labels_font_has_cyrillic(monkeypatch):
+    assert draw._has_cyrillic(draw.font(20))
+    # Шрифта с кириллицей нет — сервер не падает, берёт запасной шрифт и пишет об этом в лог.
+    monkeypatch.setattr(draw, "FONT_CANDIDATES", ("нет-такого-шрифта.ttf",))
+    draw._font_path.cache_clear()
+    draw.font.cache_clear()
+    try:
+        assert draw._font_path() is None and draw.font(20) is not None
+    finally:
+        monkeypatch.undo()
+        draw._font_path.cache_clear()
+        draw.font.cache_clear()
 
 
 def test_rulers_are_in_original_pixels():

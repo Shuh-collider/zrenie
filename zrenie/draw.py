@@ -1,15 +1,23 @@
 """Рисование поверх картинок: рамки кадров с номерами и лист из нескольких картинок."""
 
+import logging
 import math
 from dataclasses import dataclass
 from functools import lru_cache
 
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from .layout import Box
 
-# Шрифты с кириллицей: сначала системные Windows, потом общий.
-FONT_CANDIDATES = ("arial.ttf", "segoeui.ttf", "DejaVuSans.ttf")
+log = logging.getLogger(__name__)
+
+# Шрифты с кириллицей: Windows, macOS (Pillow ищет имя файла с учётом регистра), Linux.
+FONT_CANDIDATES = (
+    "arial.ttf", "segoeui.ttf",
+    "Arial.ttf", "Arial Unicode.ttf",
+    "DejaVuSans.ttf", "LiberationSans-Regular.ttf", "NotoSans-Regular.ttf", "FreeSans.ttf",
+)
 ACCENT = (255, 0, 255)  # пурпурный почти не встречается на референсах
 SHEET_BACKGROUND = (60, 60, 60)
 NEUTRAL_LIGHT = (220, 220, 220)  # бледный фон вокруг вырезанного объекта
@@ -18,14 +26,28 @@ SHEET_LABEL_H = 44
 SHEET_GAP = 12
 
 
-@lru_cache(maxsize=8)
-def font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+def _has_cyrillic(f: ImageFont.FreeTypeFont) -> bool:
+    """Нет глифа — шрифт рисует тот же квадратик, что и для заведомо несуществующего символа."""
+    return np.asarray(f.getmask("Ж")).tobytes() != np.asarray(f.getmask("\U0010ffff")).tobytes()
+
+
+@lru_cache(maxsize=1)
+def _font_path() -> str | None:
     for name in FONT_CANDIDATES:
         try:
-            return ImageFont.truetype(name, size)
+            candidate = ImageFont.truetype(name, 20)
         except OSError:
             continue
-    return ImageFont.load_default(size=size)
+        if _has_cyrillic(candidate):
+            return candidate.path
+    log.warning("Не найден шрифт с кириллицей — русские подписи на картинках будут квадратиками. Установите DejaVu Sans.")
+    return None
+
+
+@lru_cache(maxsize=8)
+def font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    path = _font_path()
+    return ImageFont.truetype(path, size) if path else ImageFont.load_default(size=size)
 
 
 def draw_boxes(img: Image.Image, boxes: list[Box], scale: float) -> Image.Image:
