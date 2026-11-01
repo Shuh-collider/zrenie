@@ -210,6 +210,31 @@ async def test_silhouette_align_export(bottle, sheet_ref, tmp_path):
 
 
 @pytest.mark.anyio
+async def test_prepare_references_in_one_call(bottle, sheet_ref, tmp_path):
+    blank = tmp_path / "пусто.png"
+    Image.new("RGB", (400, 400), (205, 207, 210)).save(blank)
+    async with Client(mcp) as client:
+        first = await client.call_tool("prepare_references", {"paths": [str(sheet_ref), bottle[0], str(blank)], "method": "simple"})
+        assert not first.is_error and first.content[0].type == "image"
+        text = first.content[1].text
+        assert "лист, кадров 4" in text and f"«{sheet_ref}|1»" in text and f"«{bottle[0]}»" in text
+        # Пустая картинка пропущена (а кадр 3 — крупный план во весь кадр — простой способ без нейросети не разбирает).
+        assert "Пропущены" in text and "пусто.png" in text and "Подписи не заданы" in text
+
+        wrong = await client.call_tool("prepare_references", {"paths": bottle, "labels": ["front"], "method": "simple"})
+        assert wrong.is_error and "Виды по порядку" in wrong.content[0].text
+
+        out = tmp_path / "подложки"
+        done = await client.call_tool(
+            "prepare_references",
+            {"paths": bottle, "labels": ["front", "side"], "folder": str(out), "real_height": 0.2, "method": "simple"},
+        )
+        assert not done.is_error
+        assert (out / "01_front.png").exists() and (out / "02_side.png").exists() and (out / "views.json").exists()
+        assert "«спереди» — «" in done.content[1].text and "Масштаб:" in done.content[1].text
+
+
+@pytest.mark.anyio
 async def test_grid_mark_contour_palette(bottle, tmp_path):
     front = bottle[0]  # тело 221×561 px (x 190…410, y 140…700), горлышко 101×101 сверху; ось на x = 300.5
     async with Client(mcp) as client:

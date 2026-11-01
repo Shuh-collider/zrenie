@@ -37,7 +37,9 @@ mcp = MCPServer(
     version=__version__,
     instructions=(
         "Зрение: показывает референсы с диска так, чтобы их было хорошо видно, для 3D-моделирования. "
-        "Порядок работы: inspect(path) — обзор, размеры и кадры, если это лист из нескольких видов; "
+        "Быстрый старт: prepare_references(paths, labels) — листы и файлы видов → отдельные виды без фона, выровненные, "
+        "с несостыковками между видами (и PNG + views.json, если задан folder) одним вызовом. "
+        "По шагам: inspect(path) — обзор, размеры и кадры, если это лист из нескольких видов; "
         "split_views(path) — каждый кадр листа крупно; view(path, region, mode) — любая область крупно, "
         "режимы contrast / edges / tones помогают читать форму; sheet(paths) — несколько картинок на одном листе. "
         "Набор видов: silhouette(view) — объект без фона и его размеры; align_views(views, labels) — все виды одной "
@@ -331,23 +333,86 @@ def _in_original(source: vs.ViewSource, box: layout.Box) -> layout.Box:
     return layout.Box(source.box.x1 + box.x1, source.box.y1 + box.y1, source.box.x1 + box.x2, source.box.y1 + box.y2)
 
 
-def _aligned(specs: list[str], labels: list[str] | None, method: str) -> list[vs.AlignedView]:
+def _aligned(
+    specs: list[str], labels: list[str] | None, method: str, skip_empty: bool = False
+) -> tuple[list[vs.AlignedView], list[str]]:
+    """Виды для выравнивания и имена видов без объекта (с skip_empty они пропускаются, иначе — ошибка)."""
     _check_method(method)
     if not 1 <= len(specs) <= MAX_ALIGN:
         raise ToolError(f"Нужно от 1 до {MAX_ALIGN} видов, получено {len(specs)}")
     if labels is not None and len(labels) != len(specs):
         raise ToolError(f"Подписей {len(labels)}, а видов {len(specs)} — должно быть поровну")
-    result = []
+    result, empty = [], []
     for i, spec in enumerate(specs):
         source = _source(spec)
         matte = _matte(source, method)
         shape = vs.measure(matte)
         if shape is None:
-            raise ToolError(f"На виде «{source.name}» объект не найден ({matte.method}). {matte.note}")
+            if not skip_empty:
+                raise ToolError(f"На виде «{source.name}» объект не найден ({matte.method}). {matte.note}")
+            empty.append(source.name)
+            continue
         label = labels[i] if labels else None
         title = vs.label_text(label, f"{i + 1}: {source.name}")
         result.append(vs.AlignedView(source, matte, shape, vs.normalize_label(label), title, 1.0))
-    return result
+    if not result:
+        raise ToolError(f"Объект не найден ни на одном виде: {', '.join(empty)}.")
+    return result, empty
+
+
+def _align_report(aligned: list[vs.AlignedView], guides: list[float], shown: PILImage.Image, f: float) -> list[str]:
+    """Текст к листу выравнивания: где какой вид, пропорции, несостыковки. f — пикселей листа на пиксель показа."""
+    reference = next((v for v in aligned if v.label not in vs.PLAN_VIEWS), None)
+    header = f"Лист {shown.width}×{shown.height} px. Объекты одной высоты, низ на общей линии. Пурпурные линии: низ 0 %, верх 100 %"
+    if reference and guides:
+        header += f" и ключевые высоты вида «{reference.title}»: " + ", ".join(f"{g * 100:.0f} %" for g in guides)
+    lines = [header + "."]
+    for v in aligned:
+        b = _in_original(v.source, v.shape.bbox)
+        p = v.placed
+        k = f / v.scale
+        lines.append(
+            f"«{v.title}» — {v.source.name}; объект в оригинале {_box_text(b)}; ширина / высота = {v.shape.aspect:.3f}; "
+            f"на листе [{p.x1 / f:.0f}, {p.y1 / f:.0f}, {p.x2 / f:.0f}, {p.y2 / f:.0f}]; "
+            f"x_ориг = {b.x1} + (x_лист − {p.x1 / f:.0f}) × {k:.4f}, y_ориг = {b.y1} + (y_лист − {p.y1 / f:.0f}) × {k:.4f}. "
+            f"Фон: {v.matte.method}." + (f" {v.matte.note}" if v.matte.note else "")
+        )
+    problems = vs.consistency_report(aligned)
+    lines.append("Несостыковки между видами:" if problems else "Явных несостыковок по силуэтам не найдено.")
+    lines += [f"  — {p}" for p in problems]
+    return lines
+
+
+def _folder(folder: str) -> Path:
+    out = Path(folder).expanduser()
+    if not out.is_absolute():
+        raise ToolError(f"Нужен абсолютный путь к папке, получено: {folder}")
+    return out
+
+
+def _export(aligned: list[vs.AlignedView], out: Path, real_height: float | None) -> list[str]:
+    """Сохраняет PNG без фона и views.json; возвращает текст для Claude."""
+    try:
+        files, meta_path, meta = vs.export(aligned, out, real_height)
+    except OSError as e:
+        raise ToolError(f"Не удалось записать в {out}: {e}") from None
+    lines = [f"Сохранено в {out}: {len(files)} PNG и {meta_path.name}. Высота объекта на всех видах: {meta['object_height_px']} px."]
+    for record in meta["views"]:
+        line = (
+            f"  {record['file']} — «{record['title']}», {record['image_px'][0]}×{record['image_px'][1]} px, "
+            f"объект {record['object_box_px']}, низ-центр объекта {record['object_bottom_center_px']}"
+        )
+        if real_height:
+            line += (
+                f"; картинка {record['image_size_units'][0]}×{record['image_size_units'][1]} ед., центр картинки "
+                f"от низа-центра объекта {record['image_center_from_object_bottom_center_units']} (x вправо, вверх +)"
+            )
+        lines.append(line)
+    if real_height:
+        lines.append(f"Масштаб: {meta['units_per_px']:.6f} ед. на пиксель. Низ объекта — на 0, центр — на оси.")
+    else:
+        lines.append("Чтобы получить размеры в единицах сцены, передай real_height — настоящую высоту объекта.")
+    return lines
 
 
 @mcp.tool(structured_output=False)
@@ -409,30 +474,11 @@ def align_views(views: list[str], labels: list[str] | None = None, method: str =
         bottom/снизу, 3-4. С подписями сервер проверяет пары (спереди ↔ сзади, слева ↔ справа, глубина сбоку ↔ сверху).
     method: способ убрать фон, как в silhouette.
     """
-    aligned = _aligned(views, labels, method)
+    aligned, _ = _aligned(views, labels, method)
     canvas, guides = vs.compose_aligned(aligned)
     shown, _ = imaging.render(canvas, max_tokens=imaging.OVERVIEW_TOKENS)
     data, fmt = imaging.encode(shown)
-    f = canvas.width / shown.width
-
-    reference = next((v for v in aligned if v.label not in vs.PLAN_VIEWS), None)
-    header = f"Лист {shown.width}×{shown.height} px. Объекты одной высоты, низ на общей линии. Пурпурные линии: низ 0 %, верх 100 %"
-    if reference and guides:
-        header += f" и ключевые высоты вида «{reference.title}»: " + ", ".join(f"{g * 100:.0f} %" for g in guides)
-    lines = [header + "."]
-    for v in aligned:
-        b = _in_original(v.source, v.shape.bbox)
-        p = v.placed
-        k = f / v.scale
-        lines.append(
-            f"«{v.title}» — {v.source.name}; объект в оригинале {_box_text(b)}; ширина / высота = {v.shape.aspect:.3f}; "
-            f"на листе [{p.x1 / f:.0f}, {p.y1 / f:.0f}, {p.x2 / f:.0f}, {p.y2 / f:.0f}]; "
-            f"x_ориг = {b.x1} + (x_лист − {p.x1 / f:.0f}) × {k:.4f}, y_ориг = {b.y1} + (y_лист − {p.y1 / f:.0f}) × {k:.4f}. "
-            f"Фон: {v.matte.method}." + (f" {v.matte.note}" if v.matte.note else "")
-        )
-    problems = vs.consistency_report(aligned)
-    lines.append("Несостыковки между видами:" if problems else "Явных несостыковок по силуэтам не найдено.")
-    lines += [f"  — {p}" for p in problems]
+    lines = _align_report(aligned, guides, shown, canvas.width / shown.width)
     if labels is None and len(aligned) > 1:
         lines.append("Подписи видов не заданы — пары (спереди ↔ сзади и т. д.) не проверены. Передай labels.")
     return [Image(data=data, format=fmt), "\n".join(lines)]
@@ -457,34 +503,76 @@ def export_views(
     real_height: настоящая высота объекта в единицах сцены (например 0.2 для 20 см в метрах).
     method: способ убрать фон, как в silhouette.
     """
-    out = Path(folder).expanduser()
-    if not out.is_absolute():
-        raise ToolError(f"Нужен абсолютный путь к папке, получено: {folder}")
+    out = _folder(folder)
     if real_height is not None and real_height <= 0:
         raise ToolError("real_height должен быть больше нуля")
-    aligned = _aligned(views, labels, method)
-    try:
-        files, meta_path, meta = vs.export(aligned, out, real_height)
-    except OSError as e:
-        raise ToolError(f"Не удалось записать в {out}: {e}") from None
+    aligned, _ = _aligned(views, labels, method)
+    return "\n".join(_export(aligned, out, real_height))
 
-    lines = [f"Сохранено в {out}: {len(files)} PNG и {meta_path.name}. Высота объекта на всех видах: {meta['object_height_px']} px."]
-    for record in meta["views"]:
-        line = (
-            f"  {record['file']} — «{record['title']}», {record['image_px'][0]}×{record['image_px'][1]} px, "
-            f"объект {record['object_box_px']}, низ-центр объекта {record['object_bottom_center_px']}"
-        )
-        if real_height:
-            line += (
-                f"; картинка {record['image_size_units'][0]}×{record['image_size_units'][1]} ед., центр картинки "
-                f"от низа-центра объекта {record['image_center_from_object_bottom_center_units']} (x вправо, вверх +)"
-            )
-        lines.append(line)
-    if real_height:
-        lines.append(f"Масштаб: {meta['units_per_px']:.6f} ед. на пиксель. Низ объекта — на 0, центр — на оси.")
-    else:
-        lines.append("Чтобы получить размеры в единицах сцены, передай real_height — настоящую высоту объекта.")
-    return "\n".join(lines)
+
+@mcp.tool(structured_output=False)
+def prepare_references(
+    paths: list[str],
+    labels: list[str] | None = None,
+    folder: str | None = None,
+    real_height: float | None = None,
+    method: str = "auto",
+) -> list[Image | str]:
+    """Начало работы одним вызовом: листы и файлы видов → отдельные виды → фон убран → виды выровнены как на чертеже.
+
+    Заменяет inspect + split_views + align_views (+ export_views, если задан folder). Кадры листа находятся сами,
+    кадры без объекта (подписи, пустые) пропускаются. В ответе — лист выравнивания, вид «путь|N» для каждого вида
+    (для silhouette, grid, mark, contour, palette, parts), пропорции и несостыковки между видами.
+
+    paths: абсолютные пути: лист с несколькими видами и/или файлы видов по одному. Всего до 8 видов.
+    labels: что за виды по порядку — front, back, left, right, side, top, bottom, 3-4 (порядок: файлы как в paths,
+        кадры листа — слева направо, сверху вниз). С ними проверяются пары видов и называются файлы. Не знаешь
+        порядок — вызови без labels, посмотри и вызови снова с labels: фон второй раз не считается.
+    folder: абсолютный путь к папке — сохранить PNG без фона и views.json для подложек (как export_views).
+    real_height: настоящая высота объекта в единицах сцены (для views.json).
+    method: способ убрать фон, как в silhouette.
+    """
+    _check_method(method)
+    out = _folder(folder) if folder else None
+    if real_height is not None and real_height <= 0:
+        raise ToolError("real_height должен быть больше нуля")
+    if not paths:
+        raise ToolError("Нужен хотя бы один путь")
+    # Виды по порядку paths: лист — все его кадры, файл с одним видом — он сам.
+    ordered, sheets = [], []
+    for path in paths:
+        _, p, key = _open(path)
+        count = len(_cached_layout(*key).views)
+        if count > 1:
+            ordered += [f"{path}{vs.SPEC_SEPARATOR}{n}" for n in range(1, count + 1)]
+            sheets.append(f"{p.name} — лист, кадров {count}")
+        else:
+            ordered.append(path)
+    ordered, extra = ordered[:MAX_ALIGN], ordered[MAX_ALIGN:]
+    if labels is not None and len(labels) != len(ordered):
+        found = "; ".join(f"{i}: «{s}»" for i, s in enumerate(ordered, 1))
+        raise ToolError(f"Подписей {len(labels)}, а видов найдено {len(ordered)} — должно быть поровну. Виды по порядку: {found}")
+
+    aligned, empty = _aligned(ordered, labels, method, skip_empty=True)
+    canvas, guides = vs.compose_aligned(aligned)
+    shown, _ = imaging.render(canvas, max_tokens=imaging.OVERVIEW_TOKENS)
+    data, fmt = imaging.encode(shown)
+    lines = [f"Видов: {len(aligned)}." + (f" Листы: {'; '.join(sheets)}." if sheets else "")]
+    lines.append("Виды для других инструментов: " + "; ".join(f"«{v.title}» — «{v.source.spec}»" for v in aligned) + ".")
+    if empty:
+        lines.append(f"Пропущены — объекта нет (подписи, пустые кадры): {', '.join(empty)}.")
+    if extra:
+        lines.append(f"Больше {MAX_ALIGN} видов — не вошли: {', '.join(extra)}. Их можно выровнять отдельно через align_views.")
+    lines += _align_report(aligned, guides, shown, canvas.width / shown.width)
+    if out is not None:
+        lines += _export(aligned, out, real_height)
+    if labels is None and len(aligned) > 1:
+        lines.append("Подписи не заданы — посмотри на лист и вызови снова с labels по порядку видов: проверю пары и назову файлы.")
+    lines.append(
+        "Если картинку ошибочно разрезало на кадры, а это один объект, — align_views([«путь|0»]). "
+        "Дальше: silhouette, grid, mark, contour, palette, parts — по виду «путь|N»; view(путь, region) — детали крупно."
+    )
+    return [Image(data=data, format=fmt), "\n".join(lines)]
 
 
 GRID_UNITS = ("px", "percent")
