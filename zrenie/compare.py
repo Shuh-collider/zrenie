@@ -23,6 +23,16 @@ KEY_REPORT_DIFF = 0.015
 # чтобы пол или фон на рендере не раздули его до гигантского.
 CANVAS_MAX_GROWTH = 1.0
 CANVAS_MARGIN_PX = 2  # запас на сглаживание края при масштабировании
+# Сначала выравниваем по высоте и низу рамки. Если рамки не совпадают (у модели лишняя антенна или нет верхней детали),
+# масштаб сбивается у всей модели и расхождения видны везде — тогда ищем масштаб и сдвиг, при которых силуэты совпадают
+# больше всего. Масштаб — относительно выравнивания по рамке; поиск — на уменьшенных масках, сначала грубо, потом точнее.
+ALIGN_SCALES = np.geomspace(0.6, 1.6, 41)
+ALIGN_FINE = np.geomspace(0.97, 1.03, 9)
+ALIGN_COARSE_PX, ALIGN_FINE_PX = 256, 512
+ALIGN_MAX_SIZE = 3.0  # модель больше вида втрое и сильнее (пол, фон на рендере) — по совпадению не выравниваем
+ALIGN_MIN_GAIN = 0.05  # по совпадению — только если оно лучше, чем по рамке, хотя бы на 5 пунктов
+ALIGNED_BY_BOX = "по высоте и низу"
+ALIGNED_BY_OVERLAP = "по наибольшему совпадению силуэтов"
 
 MISSING = (230, 40, 40)  # есть на референсе, нет у модели
 EXTRA = (40, 110, 255)  # есть у модели, нет на референсе
@@ -59,6 +69,7 @@ class Comparison:
     findings: list[str]
     matrix: np.ndarray  # 2×3: пиксели рендера → пиксели холста (для деталей модели)
     offset: tuple[int, int]  # где на холсте левый верхний угол вида референса
+    aligned_by: str  # ALIGNED_BY_BOX или ALIGNED_BY_OVERLAP
 
     @property
     def ref_box(self) -> Box:
@@ -112,16 +123,70 @@ def _blobs(mask: np.ndarray, ref: Box, area: float) -> list[tuple[float, Box]]:
     return sorted(blobs, key=lambda b: -b[0])
 
 
+def _best_overlap(ref_mask: np.ndarray, model_mask: np.ndarray, model_box: Box, s0: float) -> tuple[float, float, float, float]:
+    """Масштаб и сдвиг рендера, при которых силуэты совпадают больше всего: (s, tx, ty, совпадение — приблизительно).
+
+    Перебираем масштаб, а лучший сдвиг для каждого масштаба сразу даёт свёртка масок (matchTemplate)."""
+    crop = model_mask[model_box.y1 : model_box.y2, model_box.x1 : model_box.x2].astype(np.float32)
+    ref = ref_mask.astype(np.float32)
+
+    def search(factors: np.ndarray, work_px: int) -> tuple[float, float, float, float]:
+        k = min(1.0, work_px / max(ref.shape))
+        small = cv2.resize(ref, (max(1, round(ref.shape[1] * k)), max(1, round(ref.shape[0] * k))), interpolation=cv2.INTER_AREA)
+        area = float(small.sum())
+        best = (-1.0, 1.0, 0.0, 0.0)
+        for f in factors:
+            mw, mh = max(1, round(model_box.w * s0 * f * k)), max(1, round(model_box.h * s0 * f * k))
+            if mw > ALIGN_MAX_SIZE * small.shape[1] or mh > ALIGN_MAX_SIZE * small.shape[0]:
+                continue
+            m = cv2.resize(crop, (mw, mh), interpolation=cv2.INTER_AREA)
+            padded = cv2.copyMakeBorder(small, mh, mh, mw, mw, cv2.BORDER_CONSTANT, value=0)
+            inter = cv2.matchTemplate(padded, m, cv2.TM_CCORR)  # площадь пересечения при каждом сдвиге
+            iou = inter / np.maximum(area + float(m.sum()) - inter, 1e-6)
+            _, value, _, (px, py) = cv2.minMaxLoc(iou)
+            if value > best[0]:  # левый верхний угол рамки модели — в пикселях вида референса
+                best = (value, float(f), (px - mw) / k, (py - mh) / k)
+        return best
+
+    _, f, _, _ = search(ALIGN_SCALES, ALIGN_COARSE_PX)
+    iou, f, x0, y0 = search(f * ALIGN_FINE, ALIGN_FINE_PX)
+    s = s0 * f
+    return s, x0 - model_box.x1 * s, y0 - model_box.y1 * s, iou
+
+
 def compare(ref_img: Image.Image, ref_matte: Matte, render_img: Image.Image, render_matte: Matte) -> Comparison | None:
     ref0 = measure(ref_matte)
     model0 = measure(render_matte)
     if ref0 is None or model0 is None:
         return None
-    height, width = ref_matte.mask.shape
     # Выравниваем по высоте и низу: рендер масштабируется так, чтобы высота силуэта совпала, низ и центр рамки — тоже.
     s = ref0.bbox.h / model0.bbox.h
     m_cx, r_cx = (model0.bbox.x1 + model0.bbox.x2) / 2, (ref0.bbox.x1 + ref0.bbox.x2) / 2
-    tx, ty = r_cx - m_cx * s, ref0.bbox.y2 - model0.bbox.y2 * s
+    by_box = _compare_aligned(ref_img, ref_matte, render_img, render_matte, model0, s, r_cx - m_cx * s, ref0.bbox.y2 - model0.bbox.y2 * s)
+    if by_box.iou >= 1 - ALIGN_MIN_GAIN:  # лучше на 5 пунктов уже не станет
+        return by_box
+    s2, tx2, ty2, estimate = _best_overlap(ref_matte.mask, render_matte.mask, model0.bbox, s)
+    if estimate < by_box.iou + ALIGN_MIN_GAIN:
+        return by_box
+    by_overlap = _compare_aligned(ref_img, ref_matte, render_img, render_matte, model0, s2, tx2, ty2, by_box.iou)
+    return by_overlap if by_overlap.iou >= by_box.iou + ALIGN_MIN_GAIN else by_box
+
+
+def _compare_aligned(
+    ref_img: Image.Image,
+    ref_matte: Matte,
+    render_img: Image.Image,
+    render_matte: Matte,
+    model0: Shape,
+    s: float,
+    tx: float,
+    ty: float,
+    box_iou: float | None = None,
+) -> Comparison:
+    """Сравнение при заданном выравнивании: пиксели вида референса = s × пиксели рендера + (tx, ty).
+
+    box_iou — совпадение при выравнивании по рамке, если это выравнивание по совпадению силуэтов (для отчёта)."""
+    height, width = ref_matte.mask.shape
     # Холст — вид референса с запасом по краям, чтобы модель, которая шире кадра, вошла целиком:
     # обрезанная модель занижает расхождения. Запас слева, сверху, справа, снизу — и его потолок.
     need = (
@@ -151,13 +216,20 @@ def compare(ref_img: Image.Image, ref_matte: Matte, render_img: Image.Image, ren
 
     findings: list[str] = []
     if clipped:
-        findings.append("Модель намного шире кадра референса — часть за краем не учтена. Проверь, нет ли на рендере лишнего: пола, фона, других объектов.")
+        findings.append("Модель намного больше кадра референса — часть за краем не учтена. Проверь, нет ли на рендере лишнего: пола, фона, других объектов.")
     rb = ref.bbox
-    # Пропорции — по рендеру до выравнивания: масштаб их не меняет, а холст не обрезает.
-    aspect_diff = (model0.aspect - ref.aspect) / ref.aspect * 100
-    if abs(aspect_diff) >= BAND_REPORT_DIFF * 100:
-        findings.append(f"В целом модель {'шире' if aspect_diff > 0 else 'уже'} на {abs(aspect_diff):.1f} % при той же высоте "
-                        f"(ширина / высота: референс {ref.aspect:.3f}, модель {model0.aspect:.3f}).")
+    if box_iou is None:
+        # Пропорции — по рендеру до выравнивания: масштаб их не меняет, а холст не обрезает.
+        aspect_diff = (model0.aspect - ref.aspect) / ref.aspect * 100
+        if abs(aspect_diff) >= BAND_REPORT_DIFF * 100:
+            findings.append(f"В целом модель {'шире' if aspect_diff > 0 else 'уже'} на {abs(aspect_diff):.1f} % при той же высоте "
+                            f"(ширина / высота: референс {ref.aspect:.3f}, модель {model0.aspect:.3f}).")
+    else:
+        dw, dh = (model.bbox.w - rb.w) / rb.w * 100, (model.bbox.h - rb.h) / rb.h * 100
+        findings.append(
+            f"Рамки силуэтов не совпадают: у модели ширина {dw:+.1f} %, высота {dh:+.1f} % от референса. Поэтому модель выровнена "
+            f"по наибольшему совпадению силуэтов (по высоте и низу было бы {box_iou * 100:.1f} %) — смотри, что лишнее и чего не хватает."
+        )
 
     # Полосы по высоте: (низ %, верх %, что, разница ширины, сдвиг левого края, сдвиг правого края).
     bands: list[list] = []
@@ -211,9 +283,12 @@ def compare(ref_img: Image.Image, ref_matte: Matte, render_img: Image.Image, ren
         findings.append(f"Лишнее (синее): {total * 100:.1f} % площади; " + "; ".join(f"{a * 100:.1f} % — {_where(b, rb)}" for a, b in extra[:BLOB_REPORT]))
 
     if ref.key_heights and model.key_heights:
+        # Ключевые высоты модели — в долях рамки референса: при выравнивании по совпадению рамки разной высоты.
+        mb = model.bbox
+        model_levels = [(rb.y2 - (mb.y2 - k * mb.h)) / rb.h for k in model.key_heights]
         shifted = []
         for level in ref.key_heights:
-            nearest = min(model.key_heights, key=lambda k: abs(k - level))
+            nearest = min(model_levels, key=lambda k: abs(k - level))
             if KEY_REPORT_DIFF <= abs(nearest - level) <= KEY_MATCH_TOL:
                 shifted.append(f"{level * 100:.0f} % → у модели {nearest * 100:.0f} %")
         if shifted:
@@ -222,7 +297,8 @@ def compare(ref_img: Image.Image, ref_matte: Matte, render_img: Image.Image, ren
         findings.append(f"Отдельных частей: референс {ref.parts}, модель {model.parts}.")
     if model.holes != ref.holes:
         findings.append(f"Сквозных отверстий: референс {ref.holes}, модель {model.holes}.")
-    return Comparison(iou, s, ref, model, ref_mask, model_mask, ref_rgb, model_rgb, findings, matrix, (pad_left, pad_top))
+    aligned_by = ALIGNED_BY_BOX if box_iou is None else ALIGNED_BY_OVERLAP
+    return Comparison(iou, s, ref, model, ref_mask, model_mask, ref_rgb, model_rgb, findings, matrix, (pad_left, pad_top), aligned_by)
 
 
 def _contour(img: np.ndarray, mask: np.ndarray, colour: tuple[int, int, int], width: int) -> None:

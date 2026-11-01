@@ -1,3 +1,5 @@
+import re
+
 import numpy as np
 from PIL import Image, ImageDraw
 
@@ -45,7 +47,21 @@ def test_wider_body_and_taller_neck_are_reported():
     assert result.iou < 0.9
     text = "\n".join(result.findings)
     assert "модель шире" in text
-    assert "Ключевые высоты сдвинуты" in text or "Не хватает" in text
+    assert "Ключевые высоты сдвинуты" in text or "Не хватает" in text or "Лишнее" in text
+
+
+def test_extra_antenna_does_not_shrink_the_whole_model():
+    """Тот же флакон и тонкая антенна сверху: по рамке модель ужалась бы целиком и расходилась бы везде."""
+    render = _render(scale=1.0)
+    ImageDraw.Draw(render).rectangle([445, 500, 454, 749], fill=(170, 170, 180, 255))  # 250 px над горлышком
+    result = _compare(render)
+    assert result.aligned_by == compare.ALIGNED_BY_OVERLAP
+    assert result.iou > 0.95 and abs(result.scale - 1) < 0.02
+    text = "\n".join(result.findings)
+    height = float(re.search(r"высота \+([\d.]+) %", text).group(1))
+    assert 37 < height < 41 and "по высоте и низу было бы" in text  # антенна — 250 px над флаконом в 650 px
+    assert "Лишнее (синее)" in text and "вверху" in text
+    assert "уже" not in text  # тело и горлышко совпали — расхождений по ширине нет
 
 
 def _narrow_frame():
